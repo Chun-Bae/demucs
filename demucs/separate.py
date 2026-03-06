@@ -55,6 +55,8 @@ def main():
     parser.add_argument("tracks", nargs='+', type=Path, default=[], help='Path to tracks')
     add_model_flags(parser)
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--use-conv-stft", action="store_true",
+                        help="Use Conv1d STFT workaround instead of PyTorch STFT (for ONNX/CoreML testing)")
     parser.add_argument("-o",
                         "--out",
                         type=Path,
@@ -137,6 +139,18 @@ def main():
     else:
         if args.segment is not None:
             model.segment = args.segment
+
+    if args.use_conv_stft:
+        print("Using Conv STFT workaround...")
+        from .spec import ConvSTFT, ConvISTFT
+        models_to_patch = model.models if isinstance(model, BagOfModels) else [model]
+        for sub in models_to_patch:
+            if hasattr(sub, 'use_conv_stft'):
+                sub.use_conv_stft = True
+                sub.conv_stft = ConvSTFT(sub.nfft, sub.hop_length).to(next(sub.parameters()).device)
+                sub.conv_istft = ConvISTFT(sub.nfft, sub.hop_length).to(next(sub.parameters()).device)
+            else:
+                print("Warning: selected model does not support --use-conv-stft")
 
     model.cpu()
     model.eval()

@@ -130,6 +130,7 @@ class HTDemucs(nn.Module):
         samplerate=44100,
         segment=10,
         use_train_segment=True,
+        use_conv_stft=False,
     ):
         """
         Args:
@@ -239,7 +240,13 @@ class HTDemucs(nn.Module):
         self.wiener_iters = wiener_iters
         self.end_iters = end_iters
         self.freq_emb = None
+        self.use_conv_stft = use_conv_stft
         assert wiener_iters == end_iters
+
+        if self.use_conv_stft:
+            from .spec import ConvSTFT, ConvISTFT
+            self.conv_stft = ConvSTFT(self.nfft, self.hop_length)
+            self.conv_istft = ConvISTFT(self.nfft, self.hop_length)
 
         self.encoder = nn.ModuleList()
         self.decoder = nn.ModuleList()
@@ -434,30 +441,72 @@ class HTDemucs(nn.Module):
         pad = hl // 2 * 3
         x = pad1d(x, (pad, pad + le * hl - x.shape[-1]), mode="reflect")
 
-        z = spectro(x, nfft, hl)[..., :-1, :]
-        assert z.shape[-1] == le + 4, (z.shape, x.shape, le)
-        z = z[..., 2: 2 + le]
-        return z
+        if self.use_conv_stft:
+            batch, channels, time = x.shape
+            x = x.reshape(-1, time)
+            y = self.conv_stft(x) 
+            
+            _, freqs2, frames = y.shape
+            freqs = freqs2 // 2
+            
+            z_real = y[:, :freqs]
+            z_imag = y[:, freqs:]
+            
+            z = torch.stack([z_real, z_imag], dim=-1)
+            z = z.view(batch, channels, freqs, frames, 2)
+            z = z[..., :-1, :, :]
+            z = z[..., 2:2+le, :]
+            return z
+        else:
+            z = spectro(x, nfft, hl)[..., :-1, :]
+            assert z.shape[-1] == le + 4, (z.shape, x.shape, le)
+            z = z[..., 2: 2 + le]
+            return z
 
     def _ispec(self, z, length=None, scale=0):
         hl = self.hop_length // (4**scale)
-        z = F.pad(z, (0, 0, 0, 1))
-        z = F.pad(z, (2, 2))
-        pad = hl // 2 * 3
-        le = hl * int(math.ceil(length / hl)) + 2 * pad
-        x = ispectro(z, hl, length=le)
-        x = x[..., pad: pad + length]
-        return x
+        if self.use_conv_stft:
+            z = F.pad(z, (0, 0, 0, 0, 0, 1))
+            z = F.pad(z, (0, 0, 2, 2))
+            pad = hl // 2 * 3
+            le = int(hl * math.ceil(length / hl)) + 2 * pad
+            
+            *other, freqs, frames, _2 = z.shape
+            z_real = z[..., 0]
+            z_imag = z[..., 1]
+            y = torch.cat([z_real, z_imag], dim=-2)
+            y = y.view(-1, freqs * 2, frames)
+            
+            x = self.conv_istft(y, length=le)
+            x = x.view(*other, -1)
+            x = x[..., pad: pad + length]
+            return x
+        else:
+            z = F.pad(z, (0, 0, 0, 1))
+            z = F.pad(z, (2, 2))
+            pad = hl // 2 * 3
+            le = hl * int(math.ceil(length / hl)) + 2 * pad
+            x = ispectro(z, hl, length=le)
+            x = x[..., pad: pad + length]
+            return x
 
     def _magnitude(self, z):
         # return the magnitude of the spectrogram, except when cac is True,
         # in which case we just move the complex dimension to the channel one.
         if self.cac:
-            B, C, Fr, T = z.shape
-            m = torch.view_as_real(z).permute(0, 1, 4, 2, 3)
-            m = m.reshape(B, C * 2, Fr, T)
+            if self.use_conv_stft:
+                B, C, Fr, T, _2 = z.shape
+                m = z.permute(0, 1, 4, 2, 3)
+                m = m.reshape(B, C * 2, Fr, T)
+            else:
+                B, C, Fr, T = z.shape
+                m = torch.view_as_real(z).permute(0, 1, 4, 2, 3)
+                m = m.reshape(B, C * 2, Fr, T)
         else:
-            m = z.abs()
+            if self.use_conv_stft:
+                m = torch.norm(z, dim=-1)
+            else:
+                m = z.abs()
         return m
 
     def _mask(self, z, m):
@@ -465,10 +514,15 @@ class HTDemucs(nn.Module):
         # If `cac` is True, `m` is actually a full spectrogram and `z` is ignored.
         niters = self.wiener_iters
         if self.cac:
-            B, S, C, Fr, T = m.shape
-            out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
-            out = torch.view_as_complex(out.contiguous())
-            return out
+            if self.use_conv_stft:
+                B, S, C, Fr, T = m.shape
+                out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
+                return out
+            else:
+                B, S, C, Fr, T = m.shape
+                out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
+                out = torch.view_as_complex(out.contiguous())
+                return out
         if self.training:
             niters = self.end_iters
         if niters < 0:
